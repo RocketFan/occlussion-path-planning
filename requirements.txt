@@ -3,3 +3,4 @@ shapely
 numpy
 astar
 ipympl
+scipy
