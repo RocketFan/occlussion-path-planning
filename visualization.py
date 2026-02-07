@@ -2,14 +2,22 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import numpy as np
 import numpy.typing as npt
+from matplotlib.animation import FuncAnimation
 from matplotlib.axes import Axes
+from matplotlib.figure import Figure
 from matplotlib.patches import Polygon as MplPolygon
 from shapely.geometry import MultiPolygon, Polygon
 from shapely.geometry.base import BaseGeometry
 
 from map_environment import MapEnvironment, Point2D
+from visibility import compute_visibility_polygon
+
+if TYPE_CHECKING:
+    from vehicle import Vehicle
 
 
 def plot_map(ax: Axes, map_env: MapEnvironment) -> None:
@@ -114,3 +122,128 @@ def plot_all_visibility(
     for observer, vis_poly in zip(path, visibility_polygons):
         plot_visibility(ax, observer, vis_poly)
     ax.set_title("Visibility along Path")
+
+
+# ------------------------------------------------------------------
+# Animation
+# ------------------------------------------------------------------
+
+
+def animate_vehicle(
+    fig: Figure,
+    ax: Axes,
+    map_env: MapEnvironment,
+    vehicle: "Vehicle",
+    max_vis_radius: float = 15.0,
+    dt: float = 0.1,
+    interval_ms: int = 50,
+) -> FuncAnimation:
+    """Return a `FuncAnimation` showing the vehicle traversing its path.
+
+    Parameters
+    ----------
+    fig:
+        Matplotlib figure (needed by ``FuncAnimation``).
+    ax:
+        Axes to draw on -- should already be empty or freshly created.
+    map_env:
+        The map environment (obstacles + grid).
+    vehicle:
+        A ``Vehicle`` instance initialised with a path and speed.
+    max_vis_radius:
+        Maximum visibility radius passed to the visibility computation.
+    dt:
+        Simulation time step (seconds) per animation frame.
+    interval_ms:
+        Delay between frames in milliseconds.
+
+    Returns
+    -------
+    FuncAnimation
+        The animation object.  Keep a reference to it so it is not
+        garbage-collected before playback finishes.
+    """
+    from vehicle import Vehicle  # deferred to avoid circular import
+
+    # Draw the static background once.
+    plot_map(ax, map_env)
+    plot_grid(ax, map_env)
+    plot_path(ax, vehicle.path)
+    ax.set_title("Vehicle Animation")
+
+    # Mutable artists that get updated each frame.
+    vehicle_dot, = ax.plot(
+        [], [], marker="o", color="darkorange", markersize=10, zorder=6,
+    )
+    heading_line, = ax.plot(
+        [], [], color="darkorange", linewidth=2, zorder=6,
+    )
+    # Visibility patch placeholder (replaced each frame).
+    vis_patches: list[MplPolygon] = []
+
+    total_frames: int = int(np.ceil(vehicle.total_time / dt)) + 1
+    vehicle.reset()
+
+    def _init():
+        vehicle_dot.set_data([], [])
+        heading_line.set_data([], [])
+        return (vehicle_dot, heading_line)
+
+    def _update(frame: int):
+        nonlocal vis_patches
+
+        # Remove previous visibility patches.
+        for p in vis_patches:
+            p.remove()
+        vis_patches.clear()
+
+        t: float = frame * dt
+        pos: Point2D = vehicle.position_at(t)
+        heading: float = vehicle.heading_at(t)
+
+        # Vehicle dot
+        vehicle_dot.set_data([pos.x], [pos.y])
+
+        # Short heading indicator line
+        arrow_len: float = 1.2
+        hx: float = pos.x + arrow_len * np.cos(heading)
+        hy: float = pos.y + arrow_len * np.sin(heading)
+        heading_line.set_data([pos.x, hx], [pos.y, hy])
+
+        # Visibility polygon
+        vis_poly: BaseGeometry = compute_visibility_polygon(
+            pos, map_env.obstacles, max_vis_radius,
+        )
+        if not vis_poly.is_empty:
+            polys: list[Polygon] = []
+            if isinstance(vis_poly, MultiPolygon):
+                polys = list(vis_poly.geoms)
+            elif isinstance(vis_poly, Polygon):
+                polys = [vis_poly]
+
+            for poly in polys:
+                coords: list[tuple[float, float]] = list(poly.exterior.coords)
+                patch: MplPolygon = MplPolygon(
+                    coords,
+                    closed=True,
+                    facecolor="yellow",
+                    edgecolor="orange",
+                    alpha=0.30,
+                    linewidth=0.6,
+                    zorder=2,
+                )
+                ax.add_patch(patch)
+                vis_patches.append(patch)
+
+        return (vehicle_dot, heading_line, *vis_patches)
+
+    anim: FuncAnimation = FuncAnimation(
+        fig,
+        _update,
+        init_func=_init,
+        frames=total_frames,
+        interval=interval_ms,
+        blit=False,
+        repeat=False,
+    )
+    return anim
