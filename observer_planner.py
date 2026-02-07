@@ -1,8 +1,11 @@
 """Observer vehicle path planning with three MPC-style strategies.
 
-Provides three planning strategies for an observer vehicle to maintain
-line-of-sight (LOS) with a moving target vehicle while respecting speed
-constraints and avoiding occlusion by obstacles.
+Provides three planning strategies for a Dubins observer vehicle
+(constant speed, bounded turn rate) to maintain line-of-sight (LOS)
+with a moving target vehicle while avoiding occlusion by obstacles.
+
+The observer state is ``(x, y, theta)`` and the control input is a
+scalar turn rate ``omega in [-omega_max, omega_max]``.
 
 Strategies:
     1. GreedyLookaheadPlanner  -- sample-based greedy forward simulation
@@ -54,17 +57,65 @@ def has_line_of_sight(
     )
 
 
-def _move_towards(current: Point2D, target: Point2D, max_move: float) -> Point2D:
-    """Move from *current* toward *target* by at most *max_move* distance."""
-    dx: float = target.x - current.x
-    dy: float = target.y - current.y
-    dist: float = math.hypot(dx, dy)
+def _dubins_step(
+    x: float, y: float, theta: float,
+    speed: float, omega: float, dt: float,
+) -> tuple[float, float, float]:
+    """Advance one Dubins step using exact circular-arc integration.
 
-    if dist <= max_move or dist < 1e-12:
-        return target
+    Parameters
+    ----------
+    x, y, theta:
+        Current pose (position and heading in radians).
+    speed:
+        Constant forward speed.
+    omega:
+        Turn rate (rad/s).  Positive = counter-clockwise.
+    dt:
+        Time step duration.
 
-    ratio: float = max_move / dist
-    return Point2D(current.x + dx * ratio, current.y + dy * ratio)
+    Returns
+    -------
+    (x_new, y_new, theta_new)
+    """
+    theta_new: float = theta + omega * dt
+
+    if abs(omega) > 1e-9:
+        # Arc motion
+        r: float = speed / omega
+        x_new: float = x + r * (math.sin(theta_new) - math.sin(theta))
+        y_new: float = y + r * (-math.cos(theta_new) + math.cos(theta))
+    else:
+        # Straight-line motion
+        x_new = x + speed * math.cos(theta) * dt
+        y_new = y + speed * math.sin(theta) * dt
+
+    return x_new, y_new, theta_new
+
+
+def _dubins_steer_towards(
+    x: float, y: float, theta: float,
+    target_x: float, target_y: float,
+    speed: float, dt: float, omega_max: float,
+) -> tuple[float, float, float]:
+    """Pick the turn rate that best steers toward a target point.
+
+    Computes the desired heading to the target, finds the angular
+    difference, converts it to a required ``omega``, clamps to
+    ``[-omega_max, omega_max]``, and returns the resulting pose after
+    one Dubins step.
+
+    Returns
+    -------
+    (x_new, y_new, theta_new)
+    """
+    desired: float = math.atan2(target_y - y, target_x - x)
+    diff: float = desired - theta
+    # Normalise to [-pi, pi]
+    diff = math.atan2(math.sin(diff), math.cos(diff))
+    omega: float = diff / dt if dt > 0.0 else 0.0
+    omega = max(-omega_max, min(omega_max, omega))
+    return _dubins_step(x, y, theta, speed, omega, dt)
 
 
 def precompute_target_visibility(
@@ -113,15 +164,16 @@ class ObserverStrategy(ABC):
     def step(
         self,
         current_pos: Point2D,
+        current_heading: float,
         t: float,
         frame: int,
         target_vehicle: Vehicle,
         segments: list[tuple[Point2D, Point2D]],
         vis_polys: list[Polygon],
-        max_speed: float,
+        speed: float,
         dt: float,
-    ) -> Point2D:
-        """Return the next observer position."""
+    ) -> tuple[Point2D, float]:
+        """Return the next observer position and heading."""
         ...
 
 
@@ -131,18 +183,21 @@ class ObserverStrategy(ABC):
 
 
 class GreedyLookaheadPlanner(ObserverStrategy):
-    """Sample candidate positions, score via sequential forward simulation.
+    """Sample candidate turn rates, score via sequential forward simulation.
 
     Parameters
     ----------
     num_candidates:
-        Number of evenly-spaced candidate positions sampled on the
-        reachable circle at each planning step.
+        Number of evenly-spaced turn rates sampled from
+        ``[-omega_max, omega_max]`` at each planning step.
     horizon_steps:
         Number of future time steps to simulate when scoring a candidate.
     preferred_distance:
         Desired distance from the target.  The planner adds a small bonus
         for positions near this distance (secondary to LOS).
+    min_turning_radius:
+        Minimum turning radius for the Dubins vehicle.  Together with
+        ``speed`` this determines ``omega_max = speed / min_turning_radius``.
     """
 
     def __init__(
@@ -150,39 +205,46 @@ class GreedyLookaheadPlanner(ObserverStrategy):
         num_candidates: int = 36,
         horizon_steps: int = 10,
         preferred_distance: float = 5.0,
+        min_turning_radius: float = 2.5,
     ) -> None:
         self._num_candidates: int = num_candidates
         self._horizon_steps: int = horizon_steps
         self._preferred_distance: float = preferred_distance
+        self._min_turning_radius: float = min_turning_radius
 
     def step(
         self,
         current_pos: Point2D,
+        current_heading: float,
         t: float,
         frame: int,
         target_vehicle: Vehicle,
         segments: list[tuple[Point2D, Point2D]],
         vis_polys: list[Polygon],
-        max_speed: float,
+        speed: float,
         dt: float,
-    ) -> Point2D:
-        max_move: float = max_speed * dt
+    ) -> tuple[Point2D, float]:
         total_frames: int = len(vis_polys)
         pref_dist: float = self._preferred_distance
+        omega_max: float = speed / self._min_turning_radius
 
-        # Generate candidates: stay + points on the reachable circle
-        candidates: list[Point2D] = [current_pos]
+        # Generate candidate turn rates: omega=0 (straight) + uniform samples
+        candidate_omegas: list[float] = [0.0]
         for i in range(self._num_candidates):
-            angle: float = 2.0 * math.pi * i / self._num_candidates
-            cx: float = current_pos.x + max_move * math.cos(angle)
-            cy: float = current_pos.y + max_move * math.sin(angle)
-            candidates.append(Point2D(cx, cy))
+            omega: float = -omega_max + 2.0 * omega_max * i / self._num_candidates
+            candidate_omegas.append(omega)
 
         best_score: float = -float("inf")
-        best_candidate: Point2D = current_pos
+        best_pos: Point2D = current_pos
+        best_heading: float = current_heading
 
-        for c in candidates:
-            sim_pos: Point2D = c
+        for omega_c in candidate_omegas:
+            # Simulate first step with this candidate turn rate
+            sx, sy, stheta = _dubins_step(
+                current_pos.x, current_pos.y, current_heading,
+                speed, omega_c, dt,
+            )
+            sim_x, sim_y, sim_theta = sx, sy, stheta
             score: float = 0.0
 
             for k in range(1, self._horizon_steps + 1):
@@ -193,17 +255,24 @@ class GreedyLookaheadPlanner(ObserverStrategy):
                 target_k: Point2D = target_vehicle.position_at((frame + k) * dt)
                 vis_poly_k: Polygon = vis_polys[future_frame]
 
-                if vis_poly_k.contains(Point(sim_pos.x, sim_pos.y)):
+                if vis_poly_k.contains(Point(sim_x, sim_y)):
                     score += 1.0
-                    # LOS maintained -- stay at sim_pos
+                    # LOS maintained -- continue straight
+                    sim_x, sim_y, sim_theta = _dubins_step(
+                        sim_x, sim_y, sim_theta, speed, 0.0, dt,
+                    )
                 else:
-                    # No LOS -- greedily move toward target
-                    sim_pos = _move_towards(sim_pos, target_k, max_move)
+                    # No LOS -- greedily steer toward target
+                    sim_x, sim_y, sim_theta = _dubins_steer_towards(
+                        sim_x, sim_y, sim_theta,
+                        target_k.x, target_k.y,
+                        speed, dt, omega_max,
+                    )
 
                 # Small bonus for being near the preferred distance (secondary
                 # to the integer LOS score which dominates).
                 dist_to_tgt: float = math.hypot(
-                    sim_pos.x - target_k.x, sim_pos.y - target_k.y,
+                    sim_x - target_k.x, sim_y - target_k.y,
                 )
                 dist_err: float = abs(dist_to_tgt - pref_dist)
                 score += 0.05 / (1.0 + dist_err)
@@ -212,15 +281,16 @@ class GreedyLookaheadPlanner(ObserverStrategy):
             candidate_frame: int = frame + 1
             if candidate_frame < total_frames:
                 sd: float = _signed_distance_to_vis_boundary(
-                    c, vis_polys[candidate_frame],
+                    Point2D(sx, sy), vis_polys[candidate_frame],
                 )
                 score += sd * 0.01
 
             if score > best_score:
                 best_score = score
-                best_candidate = c
+                best_pos = Point2D(sx, sy)
+                best_heading = stheta
 
-        return best_candidate
+        return best_pos, best_heading
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +299,9 @@ class GreedyLookaheadPlanner(ObserverStrategy):
 
 
 class MPPIPlanner(ObserverStrategy):
-    """Model Predictive Path Integral trajectory optimisation.
+    """Model Predictive Path Integral trajectory optimisation (Dubins).
+
+    The control input is a sequence of scalar turn rates ``omega``.
 
     Parameters
     ----------
@@ -247,6 +319,8 @@ class MPPIPlanner(ObserverStrategy):
         Desired distance from the target.  The distance reward peaks
         when the observer is at this distance and falls off for
         deviations in either direction (secondary to LOS).
+    min_turning_radius:
+        Minimum turning radius for the Dubins vehicle.
     """
 
     def __init__(
@@ -256,55 +330,61 @@ class MPPIPlanner(ObserverStrategy):
         sigma: float = 1.5,
         lambda_: float = 0.1,
         preferred_distance: float = 5.0,
+        min_turning_radius: float = 2.5,
     ) -> None:
         self._K: int = K
         self._horizon_steps: int = horizon_steps
         self._sigma: float = sigma
         self._lambda: float = lambda_
         self._preferred_distance: float = preferred_distance
+        self._min_turning_radius: float = min_turning_radius
         self._nominal_U: np.ndarray | None = None
 
     def step(
         self,
         current_pos: Point2D,
+        current_heading: float,
         t: float,
         frame: int,
         target_vehicle: Vehicle,
         segments: list[tuple[Point2D, Point2D]],
         vis_polys: list[Polygon],
-        max_speed: float,
+        speed: float,
         dt: float,
-    ) -> Point2D:
+    ) -> tuple[Point2D, float]:
         H: int = self._horizon_steps
         K: int = self._K
         total_frames: int = len(vis_polys)
         pref_dist: float = self._preferred_distance
+        omega_max: float = speed / self._min_turning_radius
         w_los: float = 10.0
         w_dist: float = 1.0
 
-        # Initialise / warm-start nominal control sequence
+        # Initialise / warm-start nominal control sequence (H,) -- turn rates
         if self._nominal_U is None or self._nominal_U.shape[0] != H:
-            self._nominal_U = np.zeros((H, 2))
+            self._nominal_U = np.zeros(H)
 
         U: np.ndarray = self._nominal_U.copy()
 
-        # Sample K perturbations
-        noise: np.ndarray = np.random.randn(K, H, 2) * self._sigma
-        U_samples: np.ndarray = U[np.newaxis, :, :] + noise  # (K, H, 2)
+        # Sample K perturbations (1-D noise for each horizon step)
+        noise: np.ndarray = np.random.randn(K, H) * self._sigma
+        U_samples: np.ndarray = U[np.newaxis, :] + noise  # (K, H)
 
-        # Clamp each velocity to max_speed
-        norms: np.ndarray = np.linalg.norm(U_samples, axis=2, keepdims=True)
-        mask: np.ndarray = norms > max_speed
-        U_samples = np.where(mask, U_samples * (max_speed / np.maximum(norms, 1e-12)), U_samples)
+        # Clamp each turn rate to [-omega_max, omega_max]
+        U_samples = np.clip(U_samples, -omega_max, omega_max)
 
         # Roll out each trajectory and score
         scores: np.ndarray = np.zeros(K)
 
         for k_idx in range(K):
-            pos: np.ndarray = np.array([current_pos.x, current_pos.y])
+            px: float = current_pos.x
+            py: float = current_pos.y
+            ptheta: float = current_heading
 
             for i in range(H):
-                pos = pos + U_samples[k_idx, i] * dt
+                px, py, ptheta = _dubins_step(
+                    px, py, ptheta, speed, float(U_samples[k_idx, i]), dt,
+                )
                 future_frame: int = frame + i + 1
                 if future_frame >= total_frames:
                     break
@@ -312,11 +392,11 @@ class MPPIPlanner(ObserverStrategy):
                 t_i: float = t + (i + 1) * dt
                 target_i: Point2D = target_vehicle.position_at(t_i)
 
-                obs_pos: Point2D = Point2D(pos[0], pos[1])
+                obs_pos: Point2D = Point2D(px, py)
                 los: bool = has_line_of_sight(obs_pos, target_i, segments)
 
                 # Distance reward: peaks at preferred_distance, decays away
-                dist: float = math.hypot(pos[0] - target_i.x, pos[1] - target_i.y)
+                dist: float = math.hypot(px - target_i.x, py - target_i.y)
                 dist_err: float = abs(dist - pref_dist)
                 scores[k_idx] += w_los * float(los) + w_dist / (1.0 + dist_err)
 
@@ -326,24 +406,20 @@ class MPPIPlanner(ObserverStrategy):
         weights /= np.sum(weights)
 
         # Update nominal sequence: weighted average
-        U_new: np.ndarray = np.einsum("k,kij->ij", weights, U_samples)
+        U_new: np.ndarray = np.einsum("k,ki->i", weights, U_samples)
         self._nominal_U = U_new
 
-        # Apply first action (clamped to max_speed)
-        u0: np.ndarray = self._nominal_U[0].copy()
-        speed: float = np.linalg.norm(u0)
-        if speed > max_speed:
-            u0 *= max_speed / speed
-
-        next_pos: Point2D = Point2D(
-            current_pos.x + u0[0] * dt,
-            current_pos.y + u0[1] * dt,
+        # Apply first action (clamped to omega_max)
+        omega0: float = float(np.clip(self._nominal_U[0], -omega_max, omega_max))
+        nx, ny, ntheta = _dubins_step(
+            current_pos.x, current_pos.y, current_heading,
+            speed, omega0, dt,
         )
 
         # Shift for warm start
-        self._nominal_U = np.vstack([self._nominal_U[1:], np.zeros((1, 2))])
+        self._nominal_U = np.append(self._nominal_U[1:], 0.0)
 
-        return next_pos
+        return Point2D(nx, ny), ntheta
 
 
 # ---------------------------------------------------------------------------
@@ -352,7 +428,12 @@ class MPPIPlanner(ObserverStrategy):
 
 
 class ScipyMPCPlanner(ObserverStrategy):
-    """Receding-horizon MPC solved via ``scipy.optimize.minimize``.
+    """Receding-horizon MPC solved via ``scipy.optimize.minimize`` (Dubins).
+
+    The decision variable is a sequence of scalar turn rates
+    ``[omega_1, ..., omega_H]``.  The solver used is ``L-BFGS-B`` with
+    box bounds ``[-omega_max, omega_max]`` on each turn rate (no
+    constraint function needed).
 
     Parameters
     ----------
@@ -366,12 +447,12 @@ class ScipyMPCPlanner(ObserverStrategy):
         Weight for the distance-preference penalty.  Penalises deviation
         from *preferred_distance* rather than raw distance to target.
     w_smooth:
-        Weight for the smoothness / acceleration penalty.
-    w_speed:
-        Weight for the speed-limit violation penalty.
+        Weight for the smoothness / turn-rate jerk penalty.
     preferred_distance:
         Desired distance from the target.  The cost term is
         ``w_dist * (dist - preferred_distance)^2``.
+    min_turning_radius:
+        Minimum turning radius for the Dubins vehicle.
     """
 
     def __init__(
@@ -380,33 +461,34 @@ class ScipyMPCPlanner(ObserverStrategy):
         w_los: float = 10.0,
         w_dist: float = 1.0,
         w_smooth: float = 0.5,
-        w_speed: float = 100.0,
         preferred_distance: float = 5.0,
+        min_turning_radius: float = 2.5,
     ) -> None:
         self._horizon_steps: int = horizon_steps
         self._w_los: float = w_los
         self._w_dist: float = w_dist
         self._w_smooth: float = w_smooth
-        self._w_speed: float = w_speed
         self._preferred_distance: float = preferred_distance
-        self._prev_trajectory: np.ndarray | None = None
+        self._min_turning_radius: float = min_turning_radius
+        self._prev_omegas: np.ndarray | None = None
 
     def step(
         self,
         current_pos: Point2D,
+        current_heading: float,
         t: float,
         frame: int,
         target_vehicle: Vehicle,
         segments: list[tuple[Point2D, Point2D]],
         vis_polys: list[Polygon],
-        max_speed: float,
+        speed: float,
         dt: float,
-    ) -> Point2D:
+    ) -> tuple[Point2D, float]:
         from scipy.optimize import minimize
 
         H: int = self._horizon_steps
         total_frames: int = len(vis_polys)
-        max_move: float = max_speed * dt
+        omega_max: float = speed / self._min_turning_radius
 
         # Pre-compute target positions and vis polys for the horizon
         target_positions: list[Point2D] = []
@@ -420,88 +502,69 @@ class ScipyMPCPlanner(ObserverStrategy):
             else:
                 horizon_vis_polys.append(None)
 
-        # Warm-start initial guess
-        if self._prev_trajectory is not None and len(self._prev_trajectory) == H * 2:
-            x0: np.ndarray = np.zeros(H * 2)
-            # Shift: drop old first position, append copy of last
-            x0[: 2 * (H - 1)] = self._prev_trajectory[2:]
-            x0[2 * (H - 1) :] = self._prev_trajectory[-2:]
+        # Warm-start initial guess (turn-rate sequence)
+        if self._prev_omegas is not None and len(self._prev_omegas) == H:
+            x0: np.ndarray = np.zeros(H)
+            # Shift: drop old first, append zero
+            x0[: H - 1] = self._prev_omegas[1:]
+            x0[H - 1] = 0.0
         else:
-            x0 = np.tile([current_pos.x, current_pos.y], H)
+            x0 = np.zeros(H)
 
-        # Capture weights in local scope for the closure
+        # Capture in local scope for closures
         w_los: float = self._w_los
         w_dist: float = self._w_dist
         w_smooth: float = self._w_smooth
-        w_speed: float = self._w_speed
         pref_dist: float = self._preferred_distance
         cx: float = current_pos.x
         cy: float = current_pos.y
+        ctheta: float = current_heading
+        spd: float = speed
 
-        def cost(traj_flat: np.ndarray) -> float:
+        def cost(omega_seq: np.ndarray) -> float:
             J: float = 0.0
-
-            # Build full position array: pos[0] = current, pos[1..H] = decision
-            all_x: np.ndarray = np.empty(H + 1)
-            all_y: np.ndarray = np.empty(H + 1)
-            all_x[0] = cx
-            all_y[0] = cy
-            for k in range(H):
-                all_x[k + 1] = traj_flat[2 * k]
-                all_y[k + 1] = traj_flat[2 * k + 1]
+            px, py, ptheta = cx, cy, ctheta
 
             for k in range(H):
-                xk: float = all_x[k + 1]
-                yk: float = all_y[k + 1]
+                omega_k: float = float(omega_seq[k])
+                px, py, ptheta = _dubins_step(px, py, ptheta, spd, omega_k, dt)
 
                 # --- LOS term (penalise being outside visibility polygon)
                 vis_poly: Polygon | None = horizon_vis_polys[k]
                 if vis_poly is not None:
                     sd: float = _signed_distance_to_vis_boundary(
-                        Point2D(xk, yk), vis_poly,
+                        Point2D(px, py), vis_poly,
                     )
                     if sd < 0:
                         J += w_los * sd * sd
 
-                # --- Distance-preference term (penalise deviation from
-                #     preferred_distance rather than raw distance to target)
+                # --- Distance-preference term
                 tgt: Point2D = target_positions[k]
-                dist_to_tgt: float = math.hypot(xk - tgt.x, yk - tgt.y)
+                dist_to_tgt: float = math.hypot(px - tgt.x, py - tgt.y)
                 dist_err: float = dist_to_tgt - pref_dist
                 J += w_dist * dist_err * dist_err
 
-                # --- Speed-limit penalty
-                dx: float = xk - all_x[k]
-                dy: float = yk - all_y[k]
-                step_dist: float = math.hypot(dx, dy)
-                excess: float = step_dist - max_move
-                if excess > 0:
-                    J += w_speed * excess * excess
-
-            # --- Smoothness (acceleration penalty)
+            # --- Smoothness (turn-rate jerk penalty)
             for k in range(1, H):
-                ax: float = all_x[k + 1] - 2.0 * all_x[k] + all_x[k - 1]
-                ay: float = all_y[k + 1] - 2.0 * all_y[k] + all_y[k - 1]
-                J += w_smooth * (ax * ax + ay * ay)
+                d_omega: float = float(omega_seq[k] - omega_seq[k - 1])
+                J += w_smooth * d_omega * d_omega
 
             return J
 
-        result = minimize(cost, x0, method="L-BFGS-B")
-        self._prev_trajectory = result.x.copy()
+        # Box bounds on each turn rate
+        bounds = [(-omega_max, omega_max)] * H
 
-        # Apply first position, clamped to max speed
-        next_x: float = result.x[0]
-        next_y: float = result.x[1]
+        result = minimize(cost, x0, method="L-BFGS-B", bounds=bounds)
+        self._prev_omegas = result.x.copy()
 
-        dx: float = next_x - current_pos.x
-        dy: float = next_y - current_pos.y
-        dist: float = math.hypot(dx, dy)
-        if dist > max_move:
-            ratio: float = max_move / dist
-            next_x = current_pos.x + dx * ratio
-            next_y = current_pos.y + dy * ratio
+        # Apply first turn rate
+        omega0: float = float(np.clip(result.x[0], -omega_max, omega_max))
+        nx, ny, ntheta = _dubins_step(
+            current_pos.x, current_pos.y, current_heading,
+            speed, omega0, dt,
+        )
 
-        return Point2D(next_x, next_y)
+        return Point2D(nx, ny), ntheta
 
 
 # ---------------------------------------------------------------------------
@@ -514,13 +577,14 @@ def plan_observer_path(
     target_vehicle: Vehicle,
     obstacles: list[Polygon],
     start_pos: Point2D,
-    max_speed: float,
+    start_heading: float,
+    speed: float,
     dt: float,
     max_vis_radius: float,
-) -> list[Point2D]:
+) -> tuple[list[Point2D], list[float]]:
     """Plan the observer path using the given strategy.
 
-    Returns a list of ``Point2D`` positions, one per ``dt`` time step.
+    Returns ``(positions, headings)`` -- one entry per ``dt`` time step.
     """
     segments: list[tuple[Point2D, Point2D]] = _collect_segments(obstacles)
     vis_polys: list[Polygon] = precompute_target_visibility(
@@ -529,16 +593,20 @@ def plan_observer_path(
     total_frames: int = len(vis_polys)
 
     positions: list[Point2D] = [start_pos]
+    headings: list[float] = [start_heading]
     current_pos: Point2D = start_pos
+    current_heading: float = start_heading
 
     for frame in range(total_frames - 1):
         t: float = frame * dt
-        next_pos: Point2D = strategy.step(
-            current_pos, t, frame,
+        next_pos, next_heading = strategy.step(
+            current_pos, current_heading, t, frame,
             target_vehicle, segments, vis_polys,
-            max_speed, dt,
+            speed, dt,
         )
         positions.append(next_pos)
+        headings.append(next_heading)
         current_pos = next_pos
+        current_heading = next_heading
 
-    return positions
+    return positions, headings

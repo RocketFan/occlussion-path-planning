@@ -69,7 +69,21 @@ Key `Vehicle` methods / properties:
 
 ### `observer_planner.py` — Observer Vehicle Planning
 
-Plans the path of an observer vehicle that tries to maintain line-of-sight (LOS) with a moving target vehicle while respecting speed constraints.
+Plans the path of an observer vehicle that tries to maintain line-of-sight (LOS) with a moving target vehicle using **Dubins vehicle dynamics**.
+
+#### Dubins Dynamics
+
+The observer vehicle state is \( (x, y, \theta) \) where \( \theta \) is the heading angle. The vehicle moves at a **constant forward speed** and the only control input is the **turn rate** \( \omega \) (rad/s), bounded by \( \omega_{\max} = \text{speed} / \text{min\_turning\_radius} \). With default parameters (`speed = 3.0`, `min_turning_radius = 2.5`) this gives \( \omega_{\max} = 1.2 \) rad/s.
+
+At each time step `dt`, given turn rate \( \omega \):
+
+- **Arc motion** (\( |\omega| > \epsilon \)):
+  - \( x' = x + \frac{v}{\omega}[\sin(\theta + \omega \cdot dt) - \sin(\theta)] \)
+  - \( y' = y + \frac{v}{\omega}[-\cos(\theta + \omega \cdot dt) + \cos(\theta)] \)
+- **Straight-line** (\( \omega \approx 0 \)):
+  - \( x' = x + v \cos(\theta) \cdot dt \)
+  - \( y' = y + v \sin(\theta) \cdot dt \)
+- \( \theta' = \theta + \omega \cdot dt \)
 
 #### Key Design Principle: Time-Aware Sequential Planning
 
@@ -77,10 +91,10 @@ The problem is fundamentally **sequential in time**. Every piece of data is inde
 
 - The target is at a **specific position** \( p_\text{target}(t_k) \) at each future time step.
 - Each target position produces a **different visibility polygon** \( V(t_k) \) (because the target is in a different location relative to obstacles).
-- The observer's **reachable set** at \( t_k \) depends on where it was at \( t_{k-1} \): it is a disk of radius \( v_\max \cdot dt \) centred on \( \text{pos}_{k-1} \).
-- Therefore: the observer position at step `k` must lie in the **intersection** of \( V(t_k) \) (for LOS) and \( \text{Reachable}(\text{pos}_{k-1}) \) (for feasibility).
+- The observer's **reachable set** at \( t_k \) depends on where it was at \( t_{k-1} \): it is determined by the Dubins dynamics (constant speed, bounded turn rate) from the previous pose \( (x_{k-1}, y_{k-1}, \theta_{k-1}) \).
+- Therefore: the observer pose at step `k` must satisfy both \( V(t_k) \) (for LOS) and Dubins feasibility from the previous pose.
 
-All three planners respect this structure: trajectories are rolled out **step by step**, each step checks LOS against the **time-correct** target position and visibility polygon, and each step's position is **reachable from the previous step**.
+All three planners respect this structure: trajectories are rolled out **step by step** using `_dubins_step`, each step checks LOS against the **time-correct** target position and visibility polygon, and each step's pose is **reachable from the previous step** under Dubins constraints.
 
 Each planner also accepts a `preferred_distance` parameter (default 5.0 units).  Rather than pulling the observer as close to the target as possible, the distance objective penalises deviation from this preferred distance -- the observer tries to orbit the target at a comfortable range.  Maintaining visibility is always the **dominant** objective; the distance preference is secondary and only steers the observer when LOS permits.
 
@@ -89,79 +103,78 @@ Each planner also accepts a `preferred_distance` parameter (default 5.0 units). 
 | Function | Description |
 |---|---|
 | `has_line_of_sight(p1, p2, segments) -> bool` | Casts a ray from `p1` toward `p2`; if any obstacle segment is hit with `0 < t < 1`, LOS is blocked. Reuses `_ray_segment_intersection` from `visibility.py`. |
-| `_move_towards(current, target, max_move) -> Point2D` | Returns a point moved from `current` toward `target` by at most `max_move` distance. Used by greedy forward simulation and as a fallback. |
+| `_dubins_step(x, y, theta, speed, omega, dt) -> (x', y', theta')` | Advances one Dubins step using exact circular-arc integration. Takes the turn rate `omega` directly (not normalised). |
+| `_dubins_steer_towards(x, y, theta, target_x, target_y, speed, dt, omega_max) -> (x', y', theta')` | Picks the turn rate `omega` that best steers toward a target point, clamped to `[-omega_max, omega_max]`. Used as the greedy fallback during forward simulation. |
 | `precompute_target_visibility(target_vehicle, obstacles, dt, max_vis_radius) -> list[Polygon]` | Pre-computes the visibility polygon `V(t_k)` for each time step `t_k = 0, dt, 2*dt, ...` along the target's path. Indexed by frame: `vis_polys[k]` is the visibility polygon when the target is at `position_at(k * dt)`. |
 | `_signed_distance_to_vis_boundary(point, vis_poly) -> float` | Returns positive distance if the point is **inside** the visibility polygon (has LOS), negative if **outside**. Provides a continuous, smooth metric for optimisation (better than binary LOS). |
-| `plan_observer_path(strategy, target_vehicle, obstacles, start_pos, max_speed, dt, max_vis_radius) -> list[Point2D]` | Main planning loop. Pre-computes obstacle segments and time-indexed visibility polygons, then iterates over time steps passing the correct time index and current observer position to `strategy.step()`. Returns the full observer trajectory. |
+| `plan_observer_path(strategy, target_vehicle, obstacles, start_pos, start_heading, speed, dt, max_vis_radius) -> (list[Point2D], list[float])` | Main planning loop. Pre-computes obstacle segments and time-indexed visibility polygons, then iterates over time steps passing the correct time index and current observer pose to `strategy.step()`. Returns `(positions, headings)`. |
 
 #### Strategy 1: Greedy with Lookahead (`GreedyLookaheadPlanner`)
 
-At each time step, sample candidate next positions within the reachable set, score each by **sequentially simulating forward** over the horizon, and pick the best.
+At each time step, sample candidate turn rates within `[-omega_max, omega_max]`, score each by **sequentially simulating forward** over the horizon using Dubins dynamics, and pick the best.
 
-**Algorithm at time `t` with observer at `pos`:**
+**Algorithm at time `t` with observer at `(x, y, theta)`:**
 
-1. **Sample candidates:** Generate `num_candidates` positions on a circle of radius `max_speed * dt` around `pos`, plus "stay" at `pos`.
-2. **Score each candidate via forward simulation.** For candidate `c` at time `t + dt`:
-   - Set `sim_pos = c`, `score = 0`.
+1. **Sample candidates:** Generate `num_candidates` turn rates uniformly from `[-omega_max, omega_max]`, plus `omega = 0` (straight).
+2. **Score each candidate via forward simulation.** For candidate turn rate `omega_c`:
+   - Simulate one Dubins step to get `(sx, sy, stheta)`.
+   - Set `sim_x, sim_y, sim_theta = sx, sy, stheta`, `score = 0`.
    - For `k = 1, 2, ..., horizon_steps`:
      - Compute `t_k = t + k * dt` and the target position at that time.
-     - Check: is `sim_pos` inside `vis_polys[frame + k]`?
-     - If yes: `score += 1` (LOS maintained).
-     - Greedy propagation: if LOS, stay; if no LOS, move `sim_pos` toward `target_k` by `max_speed * dt`.
-     - **Distance preference:** `score += 0.05 / (1 + |dist_to_target - preferred_distance|)` (small bonus that peaks when the observer is at the preferred distance; secondary to the integer LOS score).
-   - **Visibility bonus:** `score += signed_distance(c, vis_polys[frame + 1]) * 0.01` (prefer being deep inside the visibility polygon, not on the edge).
-3. **Pick** the candidate with the highest score.
+     - Check: is `(sim_x, sim_y)` inside `vis_polys[frame + k]`?
+     - If yes: `score += 1` (LOS maintained); continue straight (`omega = 0`).
+     - If no: greedily steer toward target via `_dubins_steer_towards`.
+     - **Distance preference:** `score += 0.05 / (1 + |dist_to_target - preferred_distance|)`.
+   - **Visibility bonus:** `score += signed_distance((sx, sy), vis_polys[frame + 1]) * 0.01`.
+3. **Pick** the candidate with the highest score; return its first-step pose.
 
-The forward simulation is fully sequential -- each simulated step starts from the previous simulated position and checks LOS against the time-correct visibility polygon. Reachability is enforced at every step.
-
-**Parameters:** `num_candidates=36`, `horizon_steps=10`, `preferred_distance=5.0`
+**Parameters:** `num_candidates=36`, `horizon_steps=10`, `preferred_distance=5.0`, `min_turning_radius=2.5`
 
 #### Strategy 2: MPPI (`MPPIPlanner`)
 
-Sample `K` **entire trajectories** (sequences of velocity vectors) over the horizon. Each trajectory is a time-indexed sequence of positions rolled out step-by-step from the current observer position. Score each trajectory and compute the next action as a soft exponentially-weighted average.
+Sample `K` **entire trajectories** (sequences of scalar turn rates) over the horizon. Each trajectory is a time-indexed sequence of poses rolled out step-by-step from the current observer pose using Dubins dynamics. Score each trajectory and compute the next action as a soft exponentially-weighted average.
 
-**Algorithm at time `t` with observer at `pos`:**
+**Algorithm at time `t` with observer at `(x, y, theta)`:**
 
-1. **Maintain nominal control sequence** `U = [u_0, ..., u_{H-1}]` (2-D velocity vectors, warm-started from the shifted previous solution).
-2. **Sample `K` perturbations:** `U_k = U + noise_k`, where `noise_k ~ N(0, sigma^2 * I)`. Clamp each `||u_i|| <= max_speed`.
-3. **Roll out each trajectory sequentially:**
-   - `pos_0 = pos` (current observer position).
+1. **Maintain nominal control sequence** `U = [omega_0, ..., omega_{H-1}]` (scalar turn rates, warm-started from the shifted previous solution).
+2. **Sample `K` perturbations:** `U_k = U + noise_k`, where `noise_k ~ N(0, sigma^2)`. Clamp each `omega_i` to `[-omega_max, omega_max]`.
+3. **Roll out each trajectory sequentially** using `_dubins_step`:
+   - `pose_0 = (x, y, theta)`.
    - For `i = 0, ..., H-1`:
-     - `pos_{i+1} = pos_i + U_k[i] * dt` (each position depends on the previous).
+     - `pose_{i+1} = _dubins_step(pose_i, speed, U_k[i], dt)`.
      - `t_i = t + (i+1) * dt`.
      - Check LOS: `has_line_of_sight(pos_{i+1}, target_at(t_i), segments)`.
-4. **Score each trajectory:** `S_k = sum(w_los * los_i + w_dist / (1 + |dist(pos_i, target_i) - preferred_distance|))` where each `target_i` is at the time-correct position. The distance reward peaks when the observer is at `preferred_distance` from the target.
+4. **Score each trajectory:** `S_k = sum(w_los * los_i + w_dist / (1 + |dist(pos_i, target_i) - preferred_distance|))`.
 5. **Compute weights:** `w_k = exp(S_k / lambda)`, normalise.
 6. **Update nominal sequence:** `U = sum(w_k * U_k)`.
-7. **Apply first action:** `next_pos = pos + U[0] * dt`, clamped to `max_speed`.
+7. **Apply first action:** simulate one Dubins step with `omega_0`, clamped to `omega_max`.
 8. **Shift** for warm start: `U = [U[1], ..., U[H-1], 0]`.
 
-Every trajectory is a time-indexed sequence. Position at step `i` is derived from step `i-1` (reachability). LOS at step `i` is checked against the time-correct target. The soft averaging naturally balances exploration.
-
-**Parameters:** `K=128`, `horizon_steps=10`, `sigma=1.5`, `lambda_=0.1`, `preferred_distance=5.0`
+**Parameters:** `K=128`, `horizon_steps=10`, `sigma=1.5`, `lambda_=0.1`, `preferred_distance=5.0`, `min_turning_radius=2.5`
 
 #### Strategy 3: Scipy Optimisation MPC (`ScipyMPCPlanner`)
 
-Optimise a differentiable cost function over the full **time-indexed** horizon trajectory. Reachability between consecutive steps is enforced via penalty. LOS quality is measured via signed distance to the time-correct visibility polygon boundary.
+Optimise a differentiable cost function over a **turn-rate sequence** using Dubins dynamics. LOS quality is measured via signed distance to the time-correct visibility polygon boundary.
 
-**Decision variable:** flattened trajectory `[x_1, y_1, ..., x_H, y_H]` where `(x_k, y_k)` is the observer position at time `t + k * dt`.
+**Decision variable:** turn-rate sequence `[omega_1, ..., omega_H]` where `omega_k` is the turn rate applied at step `k`.  The trajectory is reconstructed from the current pose `(x, y, theta)` by forward-simulating Dubins dynamics with each turn rate.
 
-**Cost function `J(trajectory)`:**
+**Cost function `J(omega_sequence)`:**
 
-- **LOS term** (smooth, time-indexed): for each step `k`, compute the signed distance from `(x_k, y_k)` to the boundary of `vis_polys[frame + k]`. Penalise being outside: `w_los * sum_k( max(0, -signed_dist_k)^2 )`.
-- **Distance-preference term** (time-indexed): `w_dist * sum_k( (||pos_k - target_k|| - preferred_distance)^2 )`. Each step penalises deviation from `preferred_distance` to where the target actually is at that time, creating a "ring" attractor rather than a point attractor.
-- **Smoothness term**: `w_smooth * sum_k( ||(pos_{k+1} - 2*pos_k + pos_{k-1})||^2 )` -- penalises jerky motion (acceleration penalty).
-- **Speed limit** (sequential reachability): `w_speed * sum_k( max(0, ||pos_k - pos_{k-1}|| - max_speed*dt)^2 )`. Enforces that each step is reachable from the previous step within the speed limit.
+- **LOS term** (smooth, time-indexed): for each step `k`, forward-simulate from the current pose using the turn-rate sequence, then compute the signed distance from the resulting position to the boundary of `vis_polys[frame + k]`. Penalise being outside: `w_los * sum_k( max(0, -signed_dist_k)^2 )`.
+- **Distance-preference term** (time-indexed): `w_dist * sum_k( (||pos_k - target_k|| - preferred_distance)^2 )`. Each step penalises deviation from `preferred_distance` to where the target actually is at that time.
+- **Smoothness term** (turn-rate jerk): `w_smooth * sum_k( |omega_{k+1} - omega_k|^2 )` -- penalises abrupt changes in turn rate.
 
-**Solver:** `scipy.optimize.minimize(method='L-BFGS-B')`, warm-started from the shifted previous solution. After solving, apply first position `(x_1, y_1)` and shift the trajectory for warm start at the next time step (receding horizon).
+**Bounds:** `[(-omega_max, omega_max)] * H` -- box bounds on each turn rate. No constraint function is needed because the constant speed is implicit in the Dubins dynamics.
 
-**Parameters:** `horizon_steps=10`, `w_los=10.0`, `w_dist=1.0`, `w_smooth=0.5`, `w_speed=100.0`, `preferred_distance=5.0`
+**Solver:** `scipy.optimize.minimize(method='L-BFGS-B')` with box bounds on omega, warm-started from the shifted previous solution. After solving, apply the first turn rate via `_dubins_step` and shift the sequence for warm start at the next time step (receding horizon).
+
+**Parameters:** `horizon_steps=10`, `w_los=10.0`, `w_dist=1.0`, `w_smooth=0.5`, `preferred_distance=5.0`, `min_turning_radius=2.5`
 
 #### Complexity Estimates
 
-- **Greedy Lookahead:** 36 candidates x 10 horizon steps x ~30 segments = ~10K LOS checks per planning step. ~1.5M total over ~140 steps.
-- **MPPI:** 128 trajectories x 10 steps x ~30 segments = ~38K per planning step. ~5.4M total.
-- **Scipy MPC:** ~50 optimiser iterations x 10 steps x 1 vis polygon containment check = ~500 per step, but vis polygon distance is more expensive than raw ray checks. ~15K equivalent per step. ~2.1M total.
+- **Greedy Lookahead:** 36 candidate turn rates x 10 horizon steps x ~30 segments = ~10K LOS checks per planning step. ~1.5M total over ~140 steps.
+- **MPPI:** 128 trajectories x 10 Dubins steps x ~30 segments = ~38K per planning step. ~5.4M total.
+- **Scipy MPC:** ~50 optimiser iterations x 10 Dubins steps x 1 vis polygon containment check = ~500 per step, but vis polygon distance is more expensive than raw ray checks. ~15K equivalent per step. ~2.1M total.
 - **Precomputed visibility polygons:** ~140 computations (one per dt step), each ~400 ray casts x 30 segments = ~12K. Total: ~1.7M (one-time cost, shared by all planners).
 
 All comfortably fast for offline planning in Python (< 10s each).
@@ -183,7 +196,7 @@ Animation:
 | Function | Description |
 |---|---|
 | `animate_vehicle(fig, ax, map_env, vehicle, ...)` | Returns a `FuncAnimation` that shows the vehicle (orange dot + heading line), predicted future positions (green dashed line + dots), and a real-time visibility polygon (yellow region) updating each frame. Key parameters: `max_vis_radius`, `prediction_horizon`, `prediction_samples`, `dt`, `interval_ms`. |
-| `animate_two_vehicles(fig, ax, map_env, target_vehicle, observer_positions, ...)` | Returns a `FuncAnimation` showing both target (orange) and observer (cyan) vehicles. Draws the target's visibility polygon (yellow), predicted path (green dashed), and a LOS ray between the two vehicles -- solid green when clear, dashed red when occluded. Observer positions are used directly (one per frame) for synchronisation with the planner output. |
+| `animate_two_vehicles(fig, ax, map_env, target_vehicle, observer_positions, observer_headings, ...)` | Returns a `FuncAnimation` showing both target (orange) and observer (cyan) vehicles. Draws the target's visibility polygon (yellow), predicted path (green dashed), and a LOS ray between the two vehicles -- solid green when clear, dashed red when occluded. Observer positions and headings are used directly (one per frame) for synchronisation with the planner output. |
 
 ## Notebook (`notebook.ipynb`)
 

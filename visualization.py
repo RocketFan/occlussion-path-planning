@@ -269,6 +269,7 @@ def animate_two_vehicles(
     map_env: MapEnvironment,
     target_vehicle: "Vehicle",
     observer_positions: list[Point2D],
+    observer_headings: list[float],
     max_vis_radius: float = 15.0,
     prediction_horizon: float = 3.0,
     prediction_samples: int = 8,
@@ -288,9 +289,9 @@ def animate_two_vehicles(
         Pre-computed observer positions, one per frame (indexed by frame
         number).  These are used *directly* for the observer's location
         so that the animation stays in sync with the planner output.
+    observer_headings:
+        Pre-computed observer headings (radians), one per frame.
     """
-    import math as _math
-
     from visibility import _collect_segments, _ray_segment_intersection
 
     # Draw the static background once.
@@ -337,20 +338,6 @@ def animate_two_vehicles(
     # Ensure we don't exceed observer positions length
     total_frames = min(total_frames, len(observer_positions))
     target_vehicle.reset()
-
-    def _observer_heading(frame: int) -> float:
-        """Compute observer heading from consecutive positions."""
-        if frame + 1 < len(observer_positions):
-            dx: float = observer_positions[frame + 1].x - observer_positions[frame].x
-            dy: float = observer_positions[frame + 1].y - observer_positions[frame].y
-        elif frame > 0:
-            dx = observer_positions[frame].x - observer_positions[frame - 1].x
-            dy = observer_positions[frame].y - observer_positions[frame - 1].y
-        else:
-            return 0.0
-        if abs(dx) < 1e-12 and abs(dy) < 1e-12:
-            return 0.0
-        return _math.atan2(dy, dx)
 
     def _has_los(p1: Point2D, p2: Point2D) -> bool:
         """Quick LOS check using ray-segment intersection."""
@@ -447,7 +434,7 @@ def animate_two_vehicles(
         obs_pos: Point2D = observer_positions[frame]
         observer_dot.set_data([obs_pos.x], [obs_pos.y])
 
-        obs_heading: float = _observer_heading(frame)
+        obs_heading: float = observer_headings[frame]
         ohx: float = obs_pos.x + arrow_len * np.cos(obs_heading)
         ohy: float = obs_pos.y + arrow_len * np.sin(obs_heading)
         observer_heading_line.set_data([obs_pos.x, ohx], [obs_pos.y, ohy])
