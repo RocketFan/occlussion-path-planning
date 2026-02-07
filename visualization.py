@@ -135,36 +135,12 @@ def animate_vehicle(
     map_env: MapEnvironment,
     vehicle: "Vehicle",
     max_vis_radius: float = 15.0,
+    prediction_horizon: float = 3.0,
+    prediction_samples: int = 8,
     dt: float = 0.1,
     interval_ms: int = 50,
 ) -> FuncAnimation:
-    """Return a `FuncAnimation` showing the vehicle traversing its path.
-
-    Parameters
-    ----------
-    fig:
-        Matplotlib figure (needed by ``FuncAnimation``).
-    ax:
-        Axes to draw on -- should already be empty or freshly created.
-    map_env:
-        The map environment (obstacles + grid).
-    vehicle:
-        A ``Vehicle`` instance initialised with a path and speed.
-    max_vis_radius:
-        Maximum visibility radius passed to the visibility computation.
-    dt:
-        Simulation time step (seconds) per animation frame.
-    interval_ms:
-        Delay between frames in milliseconds.
-
-    Returns
-    -------
-    FuncAnimation
-        The animation object.  Keep a reference to it so it is not
-        garbage-collected before playback finishes.
-    """
     from vehicle import Vehicle  # deferred to avoid circular import
-
     # Draw the static background once.
     plot_map(ax, map_env)
     plot_grid(ax, map_env)
@@ -178,6 +154,14 @@ def animate_vehicle(
     heading_line, = ax.plot(
         [], [], color="darkorange", linewidth=2, zorder=6,
     )
+    # Prediction: a line + scatter dots for sampled future positions.
+    prediction_line, = ax.plot(
+        [], [], color="lime", linewidth=1.5, linestyle="--", zorder=5,
+    )
+    prediction_dots, = ax.plot(
+        [], [], marker="o", linestyle="None", color="lime",
+        markersize=5, zorder=5,
+    )
     # Visibility patch placeholder (replaced each frame).
     vis_patches: list[MplPolygon] = []
 
@@ -187,7 +171,9 @@ def animate_vehicle(
     def _init():
         vehicle_dot.set_data([], [])
         heading_line.set_data([], [])
-        return (vehicle_dot, heading_line)
+        prediction_line.set_data([], [])
+        prediction_dots.set_data([], [])
+        return (vehicle_dot, heading_line, prediction_line, prediction_dots)
 
     def _update(frame: int):
         nonlocal vis_patches
@@ -209,6 +195,25 @@ def animate_vehicle(
         hx: float = pos.x + arrow_len * np.cos(heading)
         hy: float = pos.y + arrow_len * np.sin(heading)
         heading_line.set_data([pos.x, hx], [pos.y, hy])
+
+        # Predicted future positions
+        predictions: list[(Point2D, float)] = vehicle.predict_positions(
+            t, prediction_horizon, prediction_samples,
+        )
+        predictions: list[Point2D] = [p[0] for p in predictions]
+
+        if predictions:
+            pred_xs: list[float] = [pos.x] + [p.x for p in predictions]
+            pred_ys: list[float] = [pos.y] + [p.y for p in predictions]
+            prediction_line.set_data(pred_xs, pred_ys)
+            # Dots only on the sampled points (not the current position).
+            prediction_dots.set_data(
+                [p.x for p in predictions],
+                [p.y for p in predictions],
+            )
+        else:
+            prediction_line.set_data([], [])
+            prediction_dots.set_data([], [])
 
         # Visibility polygon
         vis_poly: BaseGeometry = compute_visibility_polygon(
@@ -235,7 +240,11 @@ def animate_vehicle(
                 ax.add_patch(patch)
                 vis_patches.append(patch)
 
-        return (vehicle_dot, heading_line, *vis_patches)
+        return (
+            vehicle_dot, heading_line,
+            prediction_line, prediction_dots,
+            *vis_patches,
+        )
 
     anim: FuncAnimation = FuncAnimation(
         fig,

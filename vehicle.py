@@ -118,3 +118,24 @@ class Vehicle:
         dx: float = self._path[hi].x - self._path[lo].x
         dy: float = self._path[hi].y - self._path[lo].y
         return math.atan2(dy, dx)
+
+    def predict_positions(
+        self,
+        t: float,
+        horizon: float,
+        num_samples: int = 10,
+    ) -> list[(Point2D, float)]:
+        if num_samples < 1:
+            return []
+
+        sample_dt: float = horizon / num_samples
+        predictions: list[Point2D] = []
+
+        for i in range(1, num_samples + 1):
+            sample_t: float = t + i * sample_dt
+            if sample_t > self.total_time:
+                predictions.append((self.position_at(self.total_time), self.total_time))
+                break
+            predictions.append((self.position_at(sample_t), sample_t))
+
+        return predictions
