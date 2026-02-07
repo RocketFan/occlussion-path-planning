@@ -131,15 +131,29 @@ class ObserverStrategy(ABC):
 
 
 class GreedyLookaheadPlanner(ObserverStrategy):
-    """Sample candidate positions, score via sequential forward simulation."""
+    """Sample candidate positions, score via sequential forward simulation.
+
+    Parameters
+    ----------
+    num_candidates:
+        Number of evenly-spaced candidate positions sampled on the
+        reachable circle at each planning step.
+    horizon_steps:
+        Number of future time steps to simulate when scoring a candidate.
+    preferred_distance:
+        Desired distance from the target.  The planner adds a small bonus
+        for positions near this distance (secondary to LOS).
+    """
 
     def __init__(
         self,
         num_candidates: int = 36,
         horizon_steps: int = 10,
+        preferred_distance: float = 5.0,
     ) -> None:
         self._num_candidates: int = num_candidates
         self._horizon_steps: int = horizon_steps
+        self._preferred_distance: float = preferred_distance
 
     def step(
         self,
@@ -154,6 +168,7 @@ class GreedyLookaheadPlanner(ObserverStrategy):
     ) -> Point2D:
         max_move: float = max_speed * dt
         total_frames: int = len(vis_polys)
+        pref_dist: float = self._preferred_distance
 
         # Generate candidates: stay + points on the reachable circle
         candidates: list[Point2D] = [current_pos]
@@ -185,6 +200,14 @@ class GreedyLookaheadPlanner(ObserverStrategy):
                     # No LOS -- greedily move toward target
                     sim_pos = _move_towards(sim_pos, target_k, max_move)
 
+                # Small bonus for being near the preferred distance (secondary
+                # to the integer LOS score which dominates).
+                dist_to_tgt: float = math.hypot(
+                    sim_pos.x - target_k.x, sim_pos.y - target_k.y,
+                )
+                dist_err: float = abs(dist_to_tgt - pref_dist)
+                score += 0.05 / (1.0 + dist_err)
+
             # Bonus: prefer being deep inside the next-step visibility polygon
             candidate_frame: int = frame + 1
             if candidate_frame < total_frames:
@@ -206,7 +229,25 @@ class GreedyLookaheadPlanner(ObserverStrategy):
 
 
 class MPPIPlanner(ObserverStrategy):
-    """Model Predictive Path Integral trajectory optimisation."""
+    """Model Predictive Path Integral trajectory optimisation.
+
+    Parameters
+    ----------
+    K:
+        Number of sampled trajectory perturbations.
+    horizon_steps:
+        Planning horizon length (number of future time steps).
+    sigma:
+        Standard deviation of the Gaussian noise added to the nominal
+        control sequence.
+    lambda_:
+        Temperature parameter for the exponential weighting of
+        trajectory scores.
+    preferred_distance:
+        Desired distance from the target.  The distance reward peaks
+        when the observer is at this distance and falls off for
+        deviations in either direction (secondary to LOS).
+    """
 
     def __init__(
         self,
@@ -214,11 +255,13 @@ class MPPIPlanner(ObserverStrategy):
         horizon_steps: int = 10,
         sigma: float = 1.5,
         lambda_: float = 0.1,
+        preferred_distance: float = 5.0,
     ) -> None:
         self._K: int = K
         self._horizon_steps: int = horizon_steps
         self._sigma: float = sigma
         self._lambda: float = lambda_
+        self._preferred_distance: float = preferred_distance
         self._nominal_U: np.ndarray | None = None
 
     def step(
@@ -235,6 +278,7 @@ class MPPIPlanner(ObserverStrategy):
         H: int = self._horizon_steps
         K: int = self._K
         total_frames: int = len(vis_polys)
+        pref_dist: float = self._preferred_distance
         w_los: float = 10.0
         w_dist: float = 1.0
 
@@ -271,8 +315,10 @@ class MPPIPlanner(ObserverStrategy):
                 obs_pos: Point2D = Point2D(pos[0], pos[1])
                 los: bool = has_line_of_sight(obs_pos, target_i, segments)
 
+                # Distance reward: peaks at preferred_distance, decays away
                 dist: float = math.hypot(pos[0] - target_i.x, pos[1] - target_i.y)
-                scores[k_idx] += w_los * float(los) + w_dist / (1.0 + dist)
+                dist_err: float = abs(dist - pref_dist)
+                scores[k_idx] += w_los * float(los) + w_dist / (1.0 + dist_err)
 
         # Compute weights (with numerical stability)
         scores -= np.max(scores)
@@ -306,7 +352,27 @@ class MPPIPlanner(ObserverStrategy):
 
 
 class ScipyMPCPlanner(ObserverStrategy):
-    """Receding-horizon MPC solved via ``scipy.optimize.minimize``."""
+    """Receding-horizon MPC solved via ``scipy.optimize.minimize``.
+
+    Parameters
+    ----------
+    horizon_steps:
+        Planning horizon length.
+    w_los:
+        Weight for the LOS penalty (penalises being outside the
+        visibility polygon).  This is intentionally the largest weight
+        so that maintaining visibility dominates the cost.
+    w_dist:
+        Weight for the distance-preference penalty.  Penalises deviation
+        from *preferred_distance* rather than raw distance to target.
+    w_smooth:
+        Weight for the smoothness / acceleration penalty.
+    w_speed:
+        Weight for the speed-limit violation penalty.
+    preferred_distance:
+        Desired distance from the target.  The cost term is
+        ``w_dist * (dist - preferred_distance)^2``.
+    """
 
     def __init__(
         self,
@@ -315,12 +381,14 @@ class ScipyMPCPlanner(ObserverStrategy):
         w_dist: float = 1.0,
         w_smooth: float = 0.5,
         w_speed: float = 100.0,
+        preferred_distance: float = 5.0,
     ) -> None:
         self._horizon_steps: int = horizon_steps
         self._w_los: float = w_los
         self._w_dist: float = w_dist
         self._w_smooth: float = w_smooth
         self._w_speed: float = w_speed
+        self._preferred_distance: float = preferred_distance
         self._prev_trajectory: np.ndarray | None = None
 
     def step(
@@ -366,6 +434,7 @@ class ScipyMPCPlanner(ObserverStrategy):
         w_dist: float = self._w_dist
         w_smooth: float = self._w_smooth
         w_speed: float = self._w_speed
+        pref_dist: float = self._preferred_distance
         cx: float = current_pos.x
         cy: float = current_pos.y
 
@@ -394,9 +463,12 @@ class ScipyMPCPlanner(ObserverStrategy):
                     if sd < 0:
                         J += w_los * sd * sd
 
-                # --- Distance term
+                # --- Distance-preference term (penalise deviation from
+                #     preferred_distance rather than raw distance to target)
                 tgt: Point2D = target_positions[k]
-                J += w_dist * ((xk - tgt.x) ** 2 + (yk - tgt.y) ** 2)
+                dist_to_tgt: float = math.hypot(xk - tgt.x, yk - tgt.y)
+                dist_err: float = dist_to_tgt - pref_dist
+                J += w_dist * dist_err * dist_err
 
                 # --- Speed-limit penalty
                 dx: float = xk - all_x[k]

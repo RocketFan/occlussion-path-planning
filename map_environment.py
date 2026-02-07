@@ -71,7 +71,7 @@ class MapEnvironment:
                 y_max: float = y_min + self.resolution
                 cell_box: Polygon = box(x_min, y_min, x_max, y_max)
                 for obs in self.obstacles:
-                    if cell_box.intersects(obs):
+                    if obs.contains(cell_box):
                         grid[r, c] = False
                         break
 
@@ -114,15 +114,15 @@ def create_sample_map() -> MapEnvironment:
     """Return a 30x30 map with several polygon obstacles."""
     obstacles: list[Polygon] = [
         # Large L-shaped obstacle (upper-left area)
-        Polygon([(4, 20), (4, 26), (6, 26), (6, 22), (10, 22), (10, 20)]),
+        Polygon([(4, 20), (4, 26), (6, 26), (6, 22), (15, 22), (15, 20)]),
         # Rectangle (centre)
-        Polygon([(12, 12), (12, 18), (16, 18), (16, 12)]),
+        Polygon([(12, 16), (12, 20), (16, 20), (16, 16)]),
         # Triangle (lower-right)
         Polygon([(22, 4), (26, 4), (24, 8)]),
         # Narrow vertical wall
         Polygon([(8, 8), (8, 16), (9, 16), (9, 8)]),
         # Small square (upper-right)
-        Polygon([(22, 22), (22, 26), (26, 26), (26, 22)]),
+        Polygon([(15, 24), (15, 26), (26, 26), (26, 24)]),
         # Irregular quadrilateral (bottom-centre)
         Polygon([(14, 2), (18, 2), (17, 6), (13, 5)]),
     ]

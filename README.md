@@ -82,6 +82,8 @@ The problem is fundamentally **sequential in time**. Every piece of data is inde
 
 All three planners respect this structure: trajectories are rolled out **step by step**, each step checks LOS against the **time-correct** target position and visibility polygon, and each step's position is **reachable from the previous step**.
 
+Each planner also accepts a `preferred_distance` parameter (default 5.0 units).  Rather than pulling the observer as close to the target as possible, the distance objective penalises deviation from this preferred distance -- the observer tries to orbit the target at a comfortable range.  Maintaining visibility is always the **dominant** objective; the distance preference is secondary and only steers the observer when LOS permits.
+
 #### Shared Helpers
 
 | Function | Description |
@@ -106,12 +108,13 @@ At each time step, sample candidate next positions within the reachable set, sco
      - Check: is `sim_pos` inside `vis_polys[frame + k]`?
      - If yes: `score += 1` (LOS maintained).
      - Greedy propagation: if LOS, stay; if no LOS, move `sim_pos` toward `target_k` by `max_speed * dt`.
-   - **Bonus:** `score += signed_distance(c, vis_polys[frame + 1]) * 0.01` (prefer being deep inside the visibility polygon, not on the edge).
+     - **Distance preference:** `score += 0.05 / (1 + |dist_to_target - preferred_distance|)` (small bonus that peaks when the observer is at the preferred distance; secondary to the integer LOS score).
+   - **Visibility bonus:** `score += signed_distance(c, vis_polys[frame + 1]) * 0.01` (prefer being deep inside the visibility polygon, not on the edge).
 3. **Pick** the candidate with the highest score.
 
 The forward simulation is fully sequential -- each simulated step starts from the previous simulated position and checks LOS against the time-correct visibility polygon. Reachability is enforced at every step.
 
-**Parameters:** `num_candidates=36`, `horizon_steps=10`
+**Parameters:** `num_candidates=36`, `horizon_steps=10`, `preferred_distance=5.0`
 
 #### Strategy 2: MPPI (`MPPIPlanner`)
 
@@ -127,7 +130,7 @@ Sample `K` **entire trajectories** (sequences of velocity vectors) over the hori
      - `pos_{i+1} = pos_i + U_k[i] * dt` (each position depends on the previous).
      - `t_i = t + (i+1) * dt`.
      - Check LOS: `has_line_of_sight(pos_{i+1}, target_at(t_i), segments)`.
-4. **Score each trajectory:** `S_k = sum(w_los * los_i + w_dist / (1 + dist(pos_i, target_i)))` where each `target_i` is at the time-correct position.
+4. **Score each trajectory:** `S_k = sum(w_los * los_i + w_dist / (1 + |dist(pos_i, target_i) - preferred_distance|))` where each `target_i` is at the time-correct position. The distance reward peaks when the observer is at `preferred_distance` from the target.
 5. **Compute weights:** `w_k = exp(S_k / lambda)`, normalise.
 6. **Update nominal sequence:** `U = sum(w_k * U_k)`.
 7. **Apply first action:** `next_pos = pos + U[0] * dt`, clamped to `max_speed`.
@@ -135,7 +138,7 @@ Sample `K` **entire trajectories** (sequences of velocity vectors) over the hori
 
 Every trajectory is a time-indexed sequence. Position at step `i` is derived from step `i-1` (reachability). LOS at step `i` is checked against the time-correct target. The soft averaging naturally balances exploration.
 
-**Parameters:** `K=128`, `horizon_steps=10`, `sigma=1.5`, `lambda_=0.1`
+**Parameters:** `K=128`, `horizon_steps=10`, `sigma=1.5`, `lambda_=0.1`, `preferred_distance=5.0`
 
 #### Strategy 3: Scipy Optimisation MPC (`ScipyMPCPlanner`)
 
@@ -146,13 +149,13 @@ Optimise a differentiable cost function over the full **time-indexed** horizon t
 **Cost function `J(trajectory)`:**
 
 - **LOS term** (smooth, time-indexed): for each step `k`, compute the signed distance from `(x_k, y_k)` to the boundary of `vis_polys[frame + k]`. Penalise being outside: `w_los * sum_k( max(0, -signed_dist_k)^2 )`.
-- **Distance term** (time-indexed): `w_dist * sum_k( ||(x_k, y_k) - target_at(t + k*dt)||^2 )`. Each step penalises distance to where the target actually is at that time.
+- **Distance-preference term** (time-indexed): `w_dist * sum_k( (||pos_k - target_k|| - preferred_distance)^2 )`. Each step penalises deviation from `preferred_distance` to where the target actually is at that time, creating a "ring" attractor rather than a point attractor.
 - **Smoothness term**: `w_smooth * sum_k( ||(pos_{k+1} - 2*pos_k + pos_{k-1})||^2 )` -- penalises jerky motion (acceleration penalty).
 - **Speed limit** (sequential reachability): `w_speed * sum_k( max(0, ||pos_k - pos_{k-1}|| - max_speed*dt)^2 )`. Enforces that each step is reachable from the previous step within the speed limit.
 
 **Solver:** `scipy.optimize.minimize(method='L-BFGS-B')`, warm-started from the shifted previous solution. After solving, apply first position `(x_1, y_1)` and shift the trajectory for warm start at the next time step (receding horizon).
 
-**Parameters:** `horizon_steps=10`, `w_los=10.0`, `w_dist=1.0`, `w_smooth=0.5`, `w_speed=100.0`
+**Parameters:** `horizon_steps=10`, `w_los=10.0`, `w_dist=1.0`, `w_smooth=0.5`, `w_speed=100.0`, `preferred_distance=5.0`
 
 #### Complexity Estimates
 
