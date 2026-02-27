@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
+import time
 
 import numpy as np
 from shapely.geometry import Point, Polygon
@@ -49,17 +50,31 @@ def has_line_of_sight(
     dy: float = p2.y - p1.y
 
     return all(
-        (t := _ray_segment_intersection(
-            p1.x, p1.y, dx, dy,
-            seg_a.x, seg_a.y, seg_b.x, seg_b.y,
-        )) is None or not (0.0 < t < 1.0)
+        (
+            t := _ray_segment_intersection(
+                p1.x,
+                p1.y,
+                dx,
+                dy,
+                seg_a.x,
+                seg_a.y,
+                seg_b.x,
+                seg_b.y,
+            )
+        )
+        is None
+        or not (0.0 < t < 1.0)
         for seg_a, seg_b in segments
     )
 
 
 def _dubins_step(
-    x: float, y: float, theta: float,
-    speed: float, omega: float, dt: float,
+    x: float,
+    y: float,
+    theta: float,
+    speed: float,
+    omega: float,
+    dt: float,
 ) -> tuple[float, float, float]:
     """Advance one Dubins step using exact circular-arc integration.
 
@@ -80,23 +95,28 @@ def _dubins_step(
     """
     theta_new: float = theta + omega * dt
 
-    if abs(omega) > 1e-9:
-        # Arc motion
-        r: float = speed / omega
-        x_new: float = x + r * (math.sin(theta_new) - math.sin(theta))
-        y_new: float = y + r * (-math.cos(theta_new) + math.cos(theta))
-    else:
-        # Straight-line motion
-        x_new = x + speed * math.cos(theta) * dt
-        y_new = y + speed * math.sin(theta) * dt
+    # if abs(omega) > 1e-9:
+    #     # Arc motion
+    #     r: float = speed / omega
+    #     x_new: float = x + r * (math.sin(theta_new) - math.sin(theta))
+    #     y_new: float = y + r * (-math.cos(theta_new) + math.cos(theta))
+    # else:
+    # Straight-line motion
+    x_new = x + speed * math.cos(theta_new) * dt
+    y_new = y + speed * math.sin(theta_new) * dt
 
     return x_new, y_new, theta_new
 
 
 def _dubins_steer_towards(
-    x: float, y: float, theta: float,
-    target_x: float, target_y: float,
-    speed: float, dt: float, omega_max: float,
+    x: float,
+    y: float,
+    theta: float,
+    target_x: float,
+    target_y: float,
+    speed: float,
+    dt: float,
+    omega_max: float,
 ) -> tuple[float, float, float]:
     """Pick the turn rate that best steers toward a target point.
 
@@ -133,7 +153,9 @@ def precompute_target_visibility(
     total_frames: int = int(math.ceil(target_vehicle.total_time / dt)) + 1
     vis_polys: list[Polygon] = [
         compute_visibility_polygon(
-            target_vehicle.position_at(k * dt), obstacles, max_vis_radius,
+            target_vehicle.position_at(k * dt),
+            obstacles,
+            max_vis_radius,
         )
         for k in range(total_frames)
     ]
@@ -241,8 +263,12 @@ class GreedyLookaheadPlanner(ObserverStrategy):
         for omega_c in candidate_omegas:
             # Simulate first step with this candidate turn rate
             sx, sy, stheta = _dubins_step(
-                current_pos.x, current_pos.y, current_heading,
-                speed, omega_c, dt,
+                current_pos.x,
+                current_pos.y,
+                current_heading,
+                speed,
+                omega_c,
+                dt,
             )
             sim_x, sim_y, sim_theta = sx, sy, stheta
             score: float = 0.0
@@ -259,20 +285,31 @@ class GreedyLookaheadPlanner(ObserverStrategy):
                     score += 1.0
                     # LOS maintained -- continue straight
                     sim_x, sim_y, sim_theta = _dubins_step(
-                        sim_x, sim_y, sim_theta, speed, 0.0, dt,
+                        sim_x,
+                        sim_y,
+                        sim_theta,
+                        speed,
+                        0.0,
+                        dt,
                     )
                 else:
                     # No LOS -- greedily steer toward target
                     sim_x, sim_y, sim_theta = _dubins_steer_towards(
-                        sim_x, sim_y, sim_theta,
-                        target_k.x, target_k.y,
-                        speed, dt, omega_max,
+                        sim_x,
+                        sim_y,
+                        sim_theta,
+                        target_k.x,
+                        target_k.y,
+                        speed,
+                        dt,
+                        omega_max,
                     )
 
                 # Small bonus for being near the preferred distance (secondary
                 # to the integer LOS score which dominates).
                 dist_to_tgt: float = math.hypot(
-                    sim_x - target_k.x, sim_y - target_k.y,
+                    sim_x - target_k.x,
+                    sim_y - target_k.y,
                 )
                 dist_err: float = abs(dist_to_tgt - pref_dist)
                 score += 0.05 / (1.0 + dist_err)
@@ -281,7 +318,8 @@ class GreedyLookaheadPlanner(ObserverStrategy):
             candidate_frame: int = frame + 1
             if candidate_frame < total_frames:
                 sd: float = _signed_distance_to_vis_boundary(
-                    Point2D(sx, sy), vis_polys[candidate_frame],
+                    Point2D(sx, sy),
+                    vis_polys[candidate_frame],
                 )
                 score += sd * 0.01
 
@@ -383,7 +421,12 @@ class MPPIPlanner(ObserverStrategy):
 
             for i in range(H):
                 px, py, ptheta = _dubins_step(
-                    px, py, ptheta, speed, float(U_samples[k_idx, i]), dt,
+                    px,
+                    py,
+                    ptheta,
+                    speed,
+                    float(U_samples[k_idx, i]),
+                    dt,
                 )
                 future_frame: int = frame + i + 1
                 if future_frame >= total_frames:
@@ -412,8 +455,12 @@ class MPPIPlanner(ObserverStrategy):
         # Apply first action (clamped to omega_max)
         omega0: float = float(np.clip(self._nominal_U[0], -omega_max, omega_max))
         nx, ny, ntheta = _dubins_step(
-            current_pos.x, current_pos.y, current_heading,
-            speed, omega0, dt,
+            current_pos.x,
+            current_pos.y,
+            current_heading,
+            speed,
+            omega0,
+            dt,
         )
 
         # Shift for warm start
@@ -533,7 +580,8 @@ class ScipyMPCPlanner(ObserverStrategy):
                 vis_poly: Polygon | None = horizon_vis_polys[k]
                 if vis_poly is not None:
                     sd: float = _signed_distance_to_vis_boundary(
-                        Point2D(px, py), vis_poly,
+                        Point2D(px, py),
+                        vis_poly,
                     )
                     if sd < 0:
                         J += w_los * sd * sd
@@ -554,14 +602,18 @@ class ScipyMPCPlanner(ObserverStrategy):
         # Box bounds on each turn rate
         bounds = [(-omega_max, omega_max)] * H
 
-        result = minimize(cost, x0, method="L-BFGS-B", bounds=bounds)
+        result = minimize(cost, x0, method="SLSQP", bounds=bounds)
         self._prev_omegas = result.x.copy()
 
         # Apply first turn rate
         omega0: float = float(np.clip(result.x[0], -omega_max, omega_max))
         nx, ny, ntheta = _dubins_step(
-            current_pos.x, current_pos.y, current_heading,
-            speed, omega0, dt,
+            current_pos.x,
+            current_pos.y,
+            current_heading,
+            speed,
+            omega0,
+            dt,
         )
 
         return Point2D(nx, ny), ntheta
@@ -588,7 +640,10 @@ def plan_observer_path(
     """
     segments: list[tuple[Point2D, Point2D]] = _collect_segments(obstacles)
     vis_polys: list[Polygon] = precompute_target_visibility(
-        target_vehicle, obstacles, dt, max_vis_radius,
+        target_vehicle,
+        obstacles,
+        dt,
+        max_vis_radius,
     )
     total_frames: int = len(vis_polys)
 
@@ -600,9 +655,15 @@ def plan_observer_path(
     for frame in range(total_frames - 1):
         t: float = frame * dt
         next_pos, next_heading = strategy.step(
-            current_pos, current_heading, t, frame,
-            target_vehicle, segments, vis_polys,
-            speed, dt,
+            current_pos,
+            current_heading,
+            t,
+            frame,
+            target_vehicle,
+            segments,
+            vis_polys,
+            speed,
+            dt,
         )
         positions.append(next_pos)
         headings.append(next_heading)
