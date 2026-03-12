@@ -162,6 +162,11 @@ def precompute_target_visibility(
     return vis_polys
 
 
+def _vis_frame(t_plan: float, sim_dt: float, total_frames: int) -> int:
+    """Convert a planning time to the nearest simulation frame index."""
+    return min(max(int(round(t_plan / sim_dt)), 0), total_frames - 1)
+
+
 def _signed_distance_to_vis_boundary(point: Point2D, vis_poly: Polygon) -> float:
     """Signed distance to the visibility polygon boundary.
 
@@ -228,11 +233,13 @@ class GreedyLookaheadPlanner(ObserverStrategy):
         horizon_steps: int = 10,
         preferred_distance: float = 5.0,
         min_turning_radius: float = 2.5,
+        planner_dt: float = 0.15,
     ) -> None:
         self._num_candidates: int = num_candidates
         self._horizon_steps: int = horizon_steps
         self._preferred_distance: float = preferred_distance
         self._min_turning_radius: float = min_turning_radius
+        self._planner_dt: float = planner_dt
 
     def step(
         self,
@@ -249,6 +256,7 @@ class GreedyLookaheadPlanner(ObserverStrategy):
         total_frames: int = len(vis_polys)
         pref_dist: float = self._preferred_distance
         omega_max: float = speed / self._min_turning_radius
+        pdt: float = self._planner_dt
 
         # Generate candidate turn rates: omega=0 (straight) + uniform samples
         candidate_omegas: list[float] = [0.0]
@@ -261,7 +269,7 @@ class GreedyLookaheadPlanner(ObserverStrategy):
         best_heading: float = current_heading
 
         for omega_c in candidate_omegas:
-            # Simulate first step with this candidate turn rate
+            # Simulate first step with this candidate turn rate (sim dt)
             sx, sy, stheta = _dubins_step(
                 current_pos.x,
                 current_pos.y,
@@ -274,26 +282,23 @@ class GreedyLookaheadPlanner(ObserverStrategy):
             score: float = 0.0
 
             for k in range(1, self._horizon_steps + 1):
-                future_frame: int = frame + k
-                if future_frame >= total_frames:
-                    break
+                t_plan: float = t + k * pdt
+                vf: int = _vis_frame(t_plan, dt, total_frames)
 
-                target_k: Point2D = target_vehicle.position_at((frame + k) * dt)
-                vis_poly_k: Polygon = vis_polys[future_frame]
+                target_k: Point2D = target_vehicle.position_at(t_plan)
+                vis_poly_k: Polygon = vis_polys[vf]
 
                 if vis_poly_k.contains(Point(sim_x, sim_y)):
                     score += 1.0
-                    # LOS maintained -- continue straight
                     sim_x, sim_y, sim_theta = _dubins_step(
                         sim_x,
                         sim_y,
                         sim_theta,
                         speed,
                         0.0,
-                        dt,
+                        pdt,
                     )
                 else:
-                    # No LOS -- greedily steer toward target
                     sim_x, sim_y, sim_theta = _dubins_steer_towards(
                         sim_x,
                         sim_y,
@@ -301,7 +306,7 @@ class GreedyLookaheadPlanner(ObserverStrategy):
                         target_k.x,
                         target_k.y,
                         speed,
-                        dt,
+                        pdt,
                         omega_max,
                     )
 
@@ -369,6 +374,7 @@ class MPPIPlanner(ObserverStrategy):
         lambda_: float = 0.1,
         preferred_distance: float = 5.0,
         min_turning_radius: float = 2.5,
+        planner_dt: float = 0.15,
     ) -> None:
         self._K: int = K
         self._horizon_steps: int = horizon_steps
@@ -376,6 +382,7 @@ class MPPIPlanner(ObserverStrategy):
         self._lambda: float = lambda_
         self._preferred_distance: float = preferred_distance
         self._min_turning_radius: float = min_turning_radius
+        self._planner_dt: float = planner_dt
         self._nominal_U: np.ndarray | None = None
 
     def step(
@@ -395,6 +402,7 @@ class MPPIPlanner(ObserverStrategy):
         total_frames: int = len(vis_polys)
         pref_dist: float = self._preferred_distance
         omega_max: float = speed / self._min_turning_radius
+        pdt: float = self._planner_dt
         w_los: float = 10.0
         w_dist: float = 1.0
 
@@ -426,19 +434,18 @@ class MPPIPlanner(ObserverStrategy):
                     ptheta,
                     speed,
                     float(U_samples[k_idx, i]),
-                    dt,
+                    pdt,
                 )
-                future_frame: int = frame + i + 1
-                if future_frame >= total_frames:
+                t_i: float = t + (i + 1) * pdt
+                vf: int = _vis_frame(t_i, dt, total_frames)
+                if vf >= total_frames:
                     break
 
-                t_i: float = t + (i + 1) * dt
                 target_i: Point2D = target_vehicle.position_at(t_i)
 
                 obs_pos: Point2D = Point2D(px, py)
                 los: bool = has_line_of_sight(obs_pos, target_i, segments)
 
-                # Distance reward: peaks at preferred_distance, decays away
                 dist: float = math.hypot(px - target_i.x, py - target_i.y)
                 dist_err: float = abs(dist - pref_dist)
                 scores[k_idx] += w_los * float(los) + w_dist / (1.0 + dist_err)
@@ -452,7 +459,7 @@ class MPPIPlanner(ObserverStrategy):
         U_new: np.ndarray = np.einsum("k,ki->i", weights, U_samples)
         self._nominal_U = U_new
 
-        # Apply first action (clamped to omega_max)
+        # Apply first action with simulation dt
         omega0: float = float(np.clip(self._nominal_U[0], -omega_max, omega_max))
         nx, ny, ntheta = _dubins_step(
             current_pos.x,
@@ -472,8 +479,6 @@ class MPPIPlanner(ObserverStrategy):
 # ---------------------------------------------------------------------------
 # Strategy 3: Scipy Optimisation MPC
 # ---------------------------------------------------------------------------
-
-
 class ScipyMPCPlanner(ObserverStrategy):
     """Receding-horizon MPC solved via ``scipy.optimize.minimize`` (Dubins).
 
@@ -510,6 +515,7 @@ class ScipyMPCPlanner(ObserverStrategy):
         w_smooth: float = 0.5,
         preferred_distance: float = 5.0,
         min_turning_radius: float = 2.5,
+        planner_dt: float = 0.15,
     ) -> None:
         self._horizon_steps: int = horizon_steps
         self._w_los: float = w_los
@@ -517,6 +523,7 @@ class ScipyMPCPlanner(ObserverStrategy):
         self._w_smooth: float = w_smooth
         self._preferred_distance: float = preferred_distance
         self._min_turning_radius: float = min_turning_radius
+        self._planner_dt: float = planner_dt
         self._prev_omegas: np.ndarray | None = None
 
     def step(
@@ -536,16 +543,17 @@ class ScipyMPCPlanner(ObserverStrategy):
         H: int = self._horizon_steps
         total_frames: int = len(vis_polys)
         omega_max: float = speed / self._min_turning_radius
+        pdt: float = self._planner_dt
 
         # Pre-compute target positions and vis polys for the horizon
         target_positions: list[Point2D] = []
         horizon_vis_polys: list[Polygon | None] = []
         for k in range(1, H + 1):
-            future_frame: int = frame + k
-            t_k: float = t + k * dt
+            t_k: float = t + k * pdt
+            vf: int = _vis_frame(t_k, dt, total_frames)
             target_positions.append(target_vehicle.position_at(t_k))
-            if future_frame < total_frames:
-                horizon_vis_polys.append(vis_polys[future_frame])
+            if vf < total_frames:
+                horizon_vis_polys.append(vis_polys[vf])
             else:
                 horizon_vis_polys.append(None)
 
@@ -574,9 +582,8 @@ class ScipyMPCPlanner(ObserverStrategy):
 
             for k in range(H):
                 omega_k: float = float(omega_seq[k])
-                px, py, ptheta = _dubins_step(px, py, ptheta, spd, omega_k, dt)
+                px, py, ptheta = _dubins_step(px, py, ptheta, spd, omega_k, pdt)
 
-                # --- LOS term (penalise being outside visibility polygon)
                 vis_poly: Polygon | None = horizon_vis_polys[k]
                 if vis_poly is not None:
                     sd: float = _signed_distance_to_vis_boundary(
@@ -586,13 +593,11 @@ class ScipyMPCPlanner(ObserverStrategy):
                     if sd < 0:
                         J += w_los * sd * sd
 
-                # --- Distance-preference term
                 tgt: Point2D = target_positions[k]
                 dist_to_tgt: float = math.hypot(px - tgt.x, py - tgt.y)
                 dist_err: float = dist_to_tgt - pref_dist
                 J += w_dist * dist_err * dist_err
 
-            # --- Smoothness (turn-rate jerk penalty)
             for k in range(1, H):
                 d_omega: float = float(omega_seq[k] - omega_seq[k - 1])
                 J += w_smooth * d_omega * d_omega
@@ -605,7 +610,7 @@ class ScipyMPCPlanner(ObserverStrategy):
         result = minimize(cost, x0, method="SLSQP", bounds=bounds)
         self._prev_omegas = result.x.copy()
 
-        # Apply first turn rate
+        # Apply first turn rate with simulation dt
         omega0: float = float(np.clip(result.x[0], -omega_max, omega_max))
         nx, ny, ntheta = _dubins_step(
             current_pos.x,
@@ -615,6 +620,218 @@ class ScipyMPCPlanner(ObserverStrategy):
             omega0,
             dt,
         )
+
+        return Point2D(nx, ny), ntheta
+
+
+# ---------------------------------------------------------------------------
+# Strategy 4: Waypoint MPC (Dubins-constrained)
+# ---------------------------------------------------------------------------
+
+
+class WaypointMPCPlanner(ObserverStrategy):
+    """Receding-horizon MPC over N waypoint positions, Dubins-constrained.
+
+    Instead of optimising a sequence of turn rates, the decision
+    variables are ``N`` waypoint *positions* ``(x, y)`` that the
+    observer should fly over.  The cost is evaluated directly at the
+    waypoint positions (no forward rollout needed).  Feasibility is
+    enforced by requiring that consecutive waypoints are reachable via
+    a Dubins path within the allocated time budget.
+
+    After optimisation the planner computes the shortest Dubins path
+    from the current pose to the first waypoint and returns the
+    configuration one ``speed * dt`` step along that path.
+
+    Parameters
+    ----------
+    num_waypoints:
+        Number of waypoint positions to optimise.
+    horizon_steps:
+        Planning horizon length (in time steps).  The waypoints are
+        evenly distributed across this horizon.
+    w_los:
+        Weight for the LOS penalty (visibility polygon).
+    w_dist:
+        Weight for the distance-preference term.
+    preferred_distance:
+        Desired distance from the target.
+    min_turning_radius:
+        Minimum turning radius for the Dubins vehicle.
+    """
+
+    def __init__(
+        self,
+        num_waypoints: int = 2,
+        horizon_steps: int = 20,
+        w_los: float = 10.0,
+        w_dist: float = 1.0,
+        preferred_distance: float = 5.0,
+        min_turning_radius: float = 2.5,
+        planner_dt: float = 0.15,
+    ) -> None:
+        self._num_waypoints: int = num_waypoints
+        self._horizon_steps: int = horizon_steps
+        self._w_los: float = w_los
+        self._w_dist: float = w_dist
+        self._preferred_distance: float = preferred_distance
+        self._min_turning_radius: float = min_turning_radius
+        self._planner_dt: float = planner_dt
+        self._prev_waypoints: np.ndarray | None = None
+
+    def step(
+        self,
+        current_pos: Point2D,
+        current_heading: float,
+        t: float,
+        frame: int,
+        target_vehicle: Vehicle,
+        segments: list[tuple[Point2D, Point2D]],
+        vis_polys: list[Polygon],
+        speed: float,
+        dt: float,
+    ) -> tuple[Point2D, float]:
+        from scipy.optimize import minimize
+
+        from dubins_path import (
+            dubins_path_length,
+            dubins_path_sample,
+            dubins_shortest_path,
+        )
+
+        N: int = self._num_waypoints
+        H: int = self._horizon_steps
+        total_frames: int = len(vis_polys)
+        rho: float = self._min_turning_radius
+        pdt: float = self._planner_dt
+
+        # Pre-compute target positions and vis polys for each waypoint
+        target_positions: list[Point2D] = []
+        horizon_vis_polys: list[Polygon | None] = []
+        for i in range(N):
+            t_k: float = t + (i + 1) * N / H * pdt
+            vf: int = _vis_frame(t_k, dt, total_frames)
+            target_positions.append(target_vehicle.position_at(t_k))
+            if vf < total_frames:
+                horizon_vis_polys.append(vis_polys[vf])
+            else:
+                horizon_vis_polys.append(None)
+
+        # Time budget per segment (evenly divided)
+        seg_time: float = (H / N) * pdt
+        seg_dist_budget: float = speed * seg_time
+
+        # ---- Warm-start / initial guess --------------------------------
+        if self._prev_waypoints is not None and len(self._prev_waypoints) == 2 * N:
+            x0: np.ndarray = np.empty(2 * N)
+            # Shift: previous wp2..wpN become new wp1..wp_{N-1}
+            x0[: 2 * (N - 1)] = self._prev_waypoints[2:]
+            # New last waypoint starts at previous last waypoint position
+            x0[2 * (N - 1)] = self._prev_waypoints[-2]
+            x0[2 * (N - 1) + 1] = self._prev_waypoints[-1]
+        else:
+            x0 = np.empty(2 * N)
+            for i in range(N):
+                tgt = target_positions[i]
+                angle_to_tgt = math.atan2(
+                    tgt.y - current_pos.y, tgt.x - current_pos.x
+                )
+                x0[2 * i] = tgt.x - self._preferred_distance * math.cos(angle_to_tgt)
+                x0[2 * i + 1] = tgt.y - self._preferred_distance * math.sin(angle_to_tgt)
+
+        # Capture locals for closures
+        w_los: float = self._w_los
+        w_dist: float = self._w_dist
+        pref_dist: float = self._preferred_distance
+        cx: float = current_pos.x
+        cy: float = current_pos.y
+        ctheta: float = current_heading
+
+        def _derive_headings(
+            flat_vars: np.ndarray,
+        ) -> list[float]:
+            """Compute heading at each waypoint from the waypoint chain."""
+            wps = flat_vars.reshape(N, 2)
+            headings: list[float] = []
+            for i in range(N):
+                if i < N - 1:
+                    headings.append(
+                        math.atan2(wps[i + 1, 1] - wps[i, 1], wps[i + 1, 0] - wps[i, 0])
+                    )
+                else:
+                    tgt = target_positions[i]
+                    headings.append(
+                        math.atan2(tgt.y - wps[i, 1], tgt.x - wps[i, 0])
+                    )
+            return headings
+
+        def cost(flat_vars: np.ndarray) -> float:
+            wps = flat_vars.reshape(N, 2)
+            J: float = 0.0
+            for i in range(N):
+                wx, wy = float(wps[i, 0]), float(wps[i, 1])
+
+                vis_poly: Polygon | None = horizon_vis_polys[i]
+                if vis_poly is not None:
+                    sd: float = _signed_distance_to_vis_boundary(
+                        Point2D(wx, wy), vis_poly
+                    )
+                    if sd < 0:
+                        J += w_los * sd * sd
+
+                tgt: Point2D = target_positions[i]
+                dist_to_tgt: float = math.hypot(wx - tgt.x, wy - tgt.y)
+                dist_err: float = dist_to_tgt - pref_dist
+                J += w_dist * dist_err * dist_err
+            return J
+
+        def dubins_constraint(flat_vars: np.ndarray) -> np.ndarray:
+            """Return array of (budget - path_length) per segment; >= 0 is feasible."""
+            wps = flat_vars.reshape(N, 2)
+            headings = _derive_headings(flat_vars)
+            residuals = np.empty(N)
+
+            prev_x, prev_y, prev_theta = cx, cy, ctheta
+            for i in range(N):
+                wx, wy = float(wps[i, 0]), float(wps[i, 1])
+                wtheta = headings[i]
+                path = dubins_shortest_path(
+                    (prev_x, prev_y, prev_theta),
+                    (wx, wy, wtheta),
+                    rho,
+                )
+                if path is None:
+                    residuals[i] = -1e6
+                else:
+                    residuals[i] = seg_dist_budget - dubins_path_length(path)
+                prev_x, prev_y, prev_theta = wx, wy, wtheta
+            return residuals
+
+        constraints = {"type": "ineq", "fun": dubins_constraint}
+
+        result = minimize(
+            cost,
+            x0,
+            method="SLSQP",
+            constraints=constraints,
+            options={"maxiter": 200, "ftol": 1e-6},
+        )
+        self._prev_waypoints = result.x.copy()
+
+        # ---- Execute: Dubins path to first waypoint -------------------
+        opt_wps = result.x.reshape(N, 2)
+        headings = _derive_headings(result.x)
+        wp1_x, wp1_y = float(opt_wps[0, 0]), float(opt_wps[0, 1])
+        wp1_theta = headings[0]
+
+        path = dubins_shortest_path(
+            (cx, cy, ctheta), (wp1_x, wp1_y, wp1_theta), rho
+        )
+        if path is not None:
+            step_dist: float = speed * dt
+            nx, ny, ntheta = dubins_path_sample(path, step_dist)
+        else:
+            nx, ny, ntheta = _dubins_step(cx, cy, ctheta, speed, 0.0, dt)
 
         return Point2D(nx, ny), ntheta
 
